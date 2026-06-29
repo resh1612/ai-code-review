@@ -53,8 +53,8 @@ async def github_webhook(
 
     try:
         body: dict = json.loads(payload) if payload else {}
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
 
     action = body.get("action", "")
 
@@ -82,3 +82,5 @@ async def github_webhook(
         return {"status": "received", "review_id": str(review.id)}
 
     return {"status": "ignored"}
+
+#Testing webhook

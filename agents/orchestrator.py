@@ -1,9 +1,13 @@
 """LangGraph orchestrator for AI-powered pull-request review.
 
-Graph topology:
+Graph topology (no critical findings):
     START → planner_node → [code_quality_node, security_node] → aggregator_node → END
 
+Graph topology (critical findings present):
+    START → planner_node → [code_quality_node, security_node] → aggregator_node → patch_node → END
+
 code_quality_node and security_node run in parallel after planner_node completes.
+patch_node is an optional final step that only runs when critical findings exist.
 """
 
 from __future__ import annotations
@@ -24,9 +28,41 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from agents.code_quality_agent import CodeQualityAgent
+from agents.patch_agent import PatchAgent
 from core.config import settings
 
 logger = logging.getLogger(__name__)
+
+_trace_callback: Callable[[dict], None] | None = None
+
+
+def _findings_count_for_node(node_name: str, result: dict) -> int:
+    if node_name == "code_quality_node":
+        return len(result.get("code_quality_findings", []))
+    if node_name == "security_node":
+        return len(result.get("security_findings", []))
+    return 0
+
+
+def _emit_trace_update(
+    node_name: str,
+    started_at: datetime,
+    status: str,
+    completed_at: datetime | None = None,
+    findings_count: int = 0,
+) -> None:
+    if _trace_callback is None:
+        return
+
+    _trace_callback(
+        {
+            "agent_name": node_name,
+            "started_at": started_at.isoformat(),
+            "completed_at": completed_at.isoformat() if completed_at else None,
+            "findings_count": findings_count,
+            "status": status,
+        }
+    )
 
 # ---------------------------------------------------------------------------
 # State definition
@@ -44,6 +80,7 @@ class PRReviewState(TypedDict):
     security_findings: list[dict]
     test_findings: list[dict]
     final_summary: str
+    patch_results: list[dict]          # populated by patch_node for critical issues
     error: str | None
     agent_traces: Annotated[list[dict], operator.add]
 
@@ -73,14 +110,25 @@ def _run_traced_node(
     """Execute a node handler with tracing and uniform error handling."""
     started_at = _utc_now()
     traces = [_trace_entry(node_name, started_at, "running")]
+    _emit_trace_update(node_name, started_at, "running")
 
     try:
         result = handler(state)
+        completed_at = _utc_now()
         traces.append(_trace_entry(node_name, started_at, "completed"))
+        _emit_trace_update(
+            node_name,
+            started_at,
+            "completed",
+            completed_at,
+            _findings_count_for_node(node_name, result),
+        )
         return {**result, "agent_traces": traces}
     except Exception as exc:
         logger.exception("%s failed: %s", node_name, exc)
+        completed_at = _utc_now()
         traces.append(_trace_entry(node_name, started_at, "failed"))
+        _emit_trace_update(node_name, started_at, "failed", completed_at, 0)
         return {
             "agent_traces": traces,
             "error": f"{node_name} failed: {str(exc)}",
@@ -372,7 +420,8 @@ def _aggregator_impl(state: PRReviewState) -> dict:
         "",
         "### Summary",
         f"**{total} issue{'s' if total != 1 else ''} found:** "
-        f"{n_critical} critical · {n_warning} warning{'s' if n_warning != 1 else ''} · {n_info} info",
+        f"{n_critical} critical · {n_warning} "
+        f"warning{'s' if n_warning != 1 else ''} · {n_info} info",
         "",
     ]
 
@@ -405,6 +454,43 @@ def _aggregator_impl(state: PRReviewState) -> dict:
     return {"final_summary": final_summary}
 
 
+def _patch_impl(state: PRReviewState) -> dict:
+    """Generate minimal patches for every critical finding using PatchAgent.
+
+    Only runs when the conditional edge from aggregator_node routes here,
+    i.e. when at least one critical finding exists across all agents.
+    """
+    all_findings = (
+        (state.get("code_quality_findings") or [])
+        + (state.get("security_findings") or [])
+        + (state.get("test_findings") or [])
+    )
+    critical = [f for f in all_findings if f.get("severity") == "critical"]
+
+    if not critical:
+        logger.info("patch_node: no critical findings — skipping.")
+        return {"patch_results": []}
+
+    agent = PatchAgent()
+    llm = _get_llm()
+    results: list[dict] = []
+
+    for finding in critical:
+        result = agent.generate_patch(
+            diff=state["pr_diff"],
+            issue=finding,
+            llm=llm,
+        )
+        results.append(result)
+        logger.info(
+            "patch_node: issue_id=%s success=%s",
+            result.get("issue_id"),
+            result.get("success"),
+        )
+
+    return {"patch_results": results}
+
+
 # ---------------------------------------------------------------------------
 # Public node functions (traced + error-safe)
 # ---------------------------------------------------------------------------
@@ -426,9 +512,24 @@ def aggregator_node(state: PRReviewState) -> dict:
     return _run_traced_node("aggregator_node", state, _aggregator_impl)
 
 
+def patch_node(state: PRReviewState) -> dict:
+    return _run_traced_node("patch_node", state, _patch_impl)
+
+
 # ---------------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------------
+
+
+def _has_critical_findings(state: PRReviewState) -> str:
+    """Conditional router: send to patch_node only when critical findings exist."""
+    all_findings = (
+        (state.get("code_quality_findings") or [])
+        + (state.get("security_findings") or [])
+        + (state.get("test_findings") or [])
+    )
+    has_critical = any(f.get("severity") == "critical" for f in all_findings)
+    return "patch_node" if has_critical else END
 
 
 def _build_graph() -> Any:
@@ -439,6 +540,7 @@ def _build_graph() -> Any:
     builder.add_node("code_quality_node", code_quality_node)
     builder.add_node("security_node", security_node)
     builder.add_node("aggregator_node", aggregator_node)
+    builder.add_node("patch_node", patch_node)
 
     builder.add_edge(START, "planner_node")
 
@@ -449,7 +551,13 @@ def _build_graph() -> Any:
     # Fan-in: wait for both parallel nodes before aggregating
     builder.add_edge(["code_quality_node", "security_node"], "aggregator_node")
 
-    builder.add_edge("aggregator_node", END)
+    # Conditional: patch_node only when critical findings are present
+    builder.add_conditional_edges(
+        "aggregator_node",
+        _has_critical_findings,
+        {"patch_node": "patch_node", END: END},
+    )
+    builder.add_edge("patch_node", END)
 
     return builder.compile()
 
@@ -466,8 +574,11 @@ async def run_review(
     pr_diff: str,
     repo_name: str,
     pr_number: int,
+    trace_callback: Callable[[dict], None] | None = None,
 ) -> PRReviewState:
     """Run the full PR review pipeline and return the completed state."""
+    global _trace_callback
+
     initial_state: PRReviewState = {
         "pr_diff": pr_diff,
         "repo_name": repo_name,
@@ -477,6 +588,7 @@ async def run_review(
         "security_findings": [],
         "test_findings": [],
         "final_summary": "",
+        "patch_results": [],
         "error": None,
         "agent_traces": [],
     }
@@ -484,10 +596,14 @@ async def run_review(
     logger.info("run_review: starting for %s#%d", repo_name, pr_number)
 
     loop = asyncio.get_running_loop()
-    final_state: PRReviewState = await loop.run_in_executor(
-        None,
-        lambda: review_graph.invoke(initial_state),
-    )
+    _trace_callback = trace_callback
+    try:
+        final_state: PRReviewState = await loop.run_in_executor(
+            None,
+            lambda: review_graph.invoke(initial_state),
+        )
+    finally:
+        _trace_callback = None
 
     logger.info("run_review: completed for %s#%d", repo_name, pr_number)
     return final_state

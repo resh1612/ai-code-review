@@ -55,7 +55,8 @@ def _format_review_comment(findings: list[dict]) -> str:
         "",
         "### Summary",
         f"**{total} issue{'s' if total != 1 else ''} found:** "
-        f"{critical_count} critical · {warning_count} warning{'s' if warning_count != 1 else ''} · {info_count} info",
+        f"{critical_count} critical · {warning_count} "
+        f"warning{'s' if warning_count != 1 else ''} · {info_count} info",
         "",
     ]
 
